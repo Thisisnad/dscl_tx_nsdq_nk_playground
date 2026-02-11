@@ -1,0 +1,16 @@
+name: nasdaq-streak-screener
+region: nyc
+services:
+- name: web
+  github:
+    repo: <your-gitlab-username>/<your-repo-name>
+    branch: main
+  run_command: streamlit run nsdq_streamlit_core.py --server.port=$PORT --server.address=0.0.0.0
+  environment_slug: python
+  instance_count: 1
+  instance_size_slug: basic-xxs
+  envs:
+  - key: DASHBOARD_PASSWORD
+    value: ${DASHBOARD_PASSWORD}
+    scope: RUN_TIME
+    type: SECRET
