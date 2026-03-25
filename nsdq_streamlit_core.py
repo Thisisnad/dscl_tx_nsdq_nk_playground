@@ -119,8 +119,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
-# Use current directory for cloud deployment (files should be in same directory as script)
-DATA_DIR = Path(__file__).resolve().parent
+# Prefer script directory, then current working directory (cloud/runtime-safe)
+SCRIPT_DIR = Path(__file__).resolve().parent
+WORK_DIR = Path.cwd()
+SEARCH_DIRS = [SCRIPT_DIR] if SCRIPT_DIR == WORK_DIR else [SCRIPT_DIR, WORK_DIR]
 
 DEFAULT_CLEANUP_WORDS = [
     'corporation', 'corp', 'incorporated', 'inc', 'limited', 'ltd',
@@ -154,9 +156,35 @@ def clean_company_name(name: str, word_list: list) -> str:
 @st.cache_data(ttl=3600)
 def load_data():
     """Load and prepare all data files."""
+    def resolve_input_file(label: str, exact_names: list, prefixes: list, exts: list):
+        """Resolve input file from script/cwd with exact names first, then prefix scan."""
+        for base_dir in SEARCH_DIRS:
+            for name in exact_names:
+                p = base_dir / name
+                if p.exists():
+                    return p
+            for pref in prefixes:
+                for ext in exts:
+                    for p in sorted(base_dir.glob(f"{pref}*{ext}")):
+                        if p.is_file():
+                            return p
+        searched = ", ".join(str(d) for d in SEARCH_DIRS)
+        raise FileNotFoundError(
+            f"Missing {label} file. Searched in: {searched}. "
+            f"Tried exact names: {exact_names} and prefixes: {prefixes}"
+        )
+
     # 1. Market cap data
-    mc_path = DATA_DIR / "NK_market_cap_20260211.xlsx"
-    df_mc = pd.read_excel(mc_path, sheet_name="NASDAQ_screener")
+    mc_path = resolve_input_file(
+        label="market cap",
+        exact_names=["NK_market_cap.xlsx", "NK_market_cap_20260211.xlsx"],
+        prefixes=["NK_market_cap"],
+        exts=[".xlsx", ".xls", ".csv"],
+    )
+    if mc_path.suffix.lower() == ".csv":
+        df_mc = pd.read_csv(mc_path)
+    else:
+        df_mc = pd.read_excel(mc_path, sheet_name=0)
     df_mc.columns = df_mc.columns.str.strip()
     
     # Rename 'Name' → 'Company' if present
@@ -200,26 +228,27 @@ def load_data():
             df_mc['Market Cap $'] = df_mc[mc_cols[0]].apply(parse_market_cap)
     
     # 2. Stock price data
-    stock_path = DATA_DIR / "NK_stock_data_20260211.csv"
-    df_stock = pd.read_csv(stock_path, parse_dates=['Date'])
+    stock_path = resolve_input_file(
+        label="stock price",
+        exact_names=["NK_stock_data.csv", "NK_stock_data_20260211.csv"],
+        prefixes=["NK_stock_data"],
+        exts=[".csv", ".xlsx", ".xls"],
+    )
+    if stock_path.suffix.lower() == ".csv":
+        df_stock = pd.read_csv(stock_path, parse_dates=['Date'])
+    else:
+        df_stock = pd.read_excel(stock_path, parse_dates=['Date'])
     df_stock.columns = df_stock.columns.str.strip()
     df_stock = df_stock.sort_values(['Symbol', 'Date']).reset_index(drop=True)
     
     # 3. NASDAQ Index data
-    # Try multiple extensions
-    idx_base = "NK_nsdq_index_20260211"
-    idx_path = None
-    for ext in ['.csv', '.xlsx', '']:
-        p = DATA_DIR / (idx_base + ext)
-        if p.exists():
-            idx_path = p
-            break
-    
-    if idx_path is None:
-        # Try without extension (could be csv without extension)
-        idx_path = DATA_DIR / idx_base
-    
-    if str(idx_path).endswith('.xlsx'):
+    idx_path = resolve_input_file(
+        label="nasdaq index",
+        exact_names=["NK_nsdq_index.csv", "NK_nsdq_index_20260211.csv", "NK_nsdq_index"],
+        prefixes=["NK_nsdq_index"],
+        exts=[".csv", ".xlsx", ".xls", ""],
+    )
+    if idx_path.suffix.lower() in [".xlsx", ".xls"]:
         df_idx = pd.read_excel(idx_path, parse_dates=['Date'])
     else:
         df_idx = pd.read_csv(idx_path, parse_dates=['Date'])
@@ -265,6 +294,54 @@ def format_count(n):
     if n >= 1000:
         return f"{n/1000:,.1f}K"
     return f"{n:,}"
+
+
+def with_row_ref(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a 1-based Row Ref column for display."""
+    out = df.copy().reset_index(drop=True)
+    out.insert(0, 'Row Ref', np.arange(1, len(out) + 1))
+    return out
+
+
+def compute_year_bound_prices(df_prices: pd.DataFrame) -> pd.DataFrame:
+    """Compute yearly start/end/return for each symbol."""
+    if df_prices.empty:
+        return pd.DataFrame(columns=['Symbol', 'Year', 'Start Price', 'End Price', 'Stock Return'])
+    tmp = df_prices.copy()
+    tmp['Year'] = tmp['Date'].dt.year
+    yearly = tmp.sort_values(['Symbol', 'Date']).groupby(['Symbol', 'Year']).agg(
+        Start_Price=('Close', 'first'),
+        End_Price=('Close', 'last')
+    ).reset_index()
+    yearly['Stock_Return'] = (yearly['End_Price'] / yearly['Start_Price'] - 1) * 100
+    yearly.rename(columns={
+        'Start_Price': 'Start Price',
+        'End_Price': 'End Price',
+        'Stock_Return': 'Stock Return'
+    }, inplace=True)
+    return yearly
+
+
+def compute_index_year_returns(df_index: pd.DataFrame) -> pd.DataFrame:
+    """Compute yearly NASDAQ returns."""
+    idx = df_index.copy().sort_values('Date')
+    idx['Year'] = idx['Date'].dt.year
+    out = idx.groupby('Year').agg(
+        Start=('Close', 'first'),
+        End=('Close', 'last')
+    ).reset_index()
+    out['Nasdaq Return'] = (out['End'] / out['Start'] - 1) * 100
+    return out[['Year', 'Nasdaq Return']]
+
+
+def percentile_52w(df_symbol: pd.DataFrame) -> float:
+    """Current price percentile over latest 52 weeks (~252 trading days)."""
+    if df_symbol.empty:
+        return np.nan
+    s = df_symbol.sort_values('Date')['Close']
+    latest = s.iloc[-1]
+    window = s.tail(252)
+    return (window <= latest).mean() * 100 if len(window) > 0 else np.nan
 
 
 def compute_streaks(df_symbol):
@@ -386,6 +463,111 @@ def get_time_filter_date(option, max_date):
     return None
 
 
+# ============================================================================
+# FORMATTING FUNCTIONS | DAILY CLARION POSITION - TABLES
+# ============================================================================
+
+# RED = "#C00000"
+
+def format_value(val):
+    """
+    Formats a numeric value for Streamlit HTML display.
+    Returns an HTML string with appropriate formatting and color.
+    """
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "-"
+
+    is_negative = val < 0
+    abs_val = abs(val)
+
+    if val == 0 or pd.isna(val):
+        return "-"
+    # Rule 1: Basis points — value is a percentage, abs < 0.99%
+    if abs_val < 0.0099:
+        bps = abs_val * 10000  # convert percentage to bps
+        formatted = f"({bps:.2f})Bps" if is_negative else f"{bps:.2f} Bps"
+        # color = f' style="color:{RED}"' if is_negative else ""
+        # return f'<span{color}>{formatted}</span>'
+        return formatted
+
+    # Rule 2: Has decimal fraction
+    if val != int(val):
+        if is_negative:
+            return f"({abs_val:,.2f})"
+        return f"{val:,.2f}"
+
+    # Rule 3: Integer
+    if is_negative:
+        return f"({abs_val:,.0f})"
+    return f"{val:,.0f}"
+
+
+def format_dataframe(df: pd.DataFrame, numeric_cols: list = None) -> pd.DataFrame:
+    """
+    Applies format_value to all (or specified) numeric columns.
+    Returns a new DataFrame with HTML-formatted string values.
+    """
+    df_fmt = df.copy()
+    cols = numeric_cols or df.select_dtypes(include="number").columns.tolist()
+    for col in cols:
+        df_fmt[col] = df_fmt[col].apply(format_value)
+    return df_fmt
+
+def add_header_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds an Excel-style column reference row [A], [B], [C]...
+    Works safely even if df already has MultiIndex columns.
+    """
+
+    # If already MultiIndex → flatten first
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [str(col[-1]) for col in df.columns]
+
+    n = len(df.columns)
+
+    # Generate A, B, C, ..., Z, AA, AB if needed
+    def excel_letters(n):
+        letters = []
+        i = 0
+        while len(letters) < n:
+            s = ""
+            x = i
+            while True:
+                s = chr(65 + x % 26) + s
+                x = x // 26 - 1
+                if x < 0:
+                    break
+            letters.append(f"[{s}]")
+            i += 1
+        return letters
+
+    head_idx = excel_letters(n)
+
+    # Ensure same length
+    if len(head_idx) != n:
+        raise ValueError(
+            f"Header index mismatch: {len(head_idx)} vs {n} columns"
+        )
+
+    df = df.copy()
+    df.columns = pd.MultiIndex.from_arrays(
+        [head_idx, df.columns.astype(str)]
+    )
+
+    return df
+
+
+def center_top_index(styler):
+    """
+    Center-align the first (top) column index level.
+    """
+    return styler.set_table_styles([
+        {
+            "selector": "th.col_heading.level0",
+            "props": [("text-align", "center")]
+        }
+    ])
+
 # ─── Main App ────────────────────────────────────────────────────────────────
 
 st.markdown("# 📈 NASDAQ Stock Streak Screener")
@@ -397,10 +579,11 @@ if not data_loaded:
     st.stop()
 
 # ─── TABS ────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs([
-    "📊 Stock Price History",
-    "🔍 Stock Returns Streak Analysis",
-    "📉 Macro Level Analysis"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 [1] Stock Price History",
+    "🔍 [2] Stock Returns Streak Analysis",
+    "📉 [3] Macro Level Analysis",
+    "🗓️ [4] Annual Returns Analysis"
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -459,17 +642,21 @@ with tab1:
         c5.metric("Price Percentile", f"{percentile:.1f}%")
         
         c6, c7, c8, c9 = st.columns(4)
-        c6.metric("Date Range", f"{first_date.strftime('%Y-%m-%d')} → {latest_date.strftime('%Y-%m-%d')}")
+        c6.metric("Date Range", f"{first_date.strftime('%Y-%m-%d %A')} → {latest_date.strftime('%Y-%m-%d %A')}")
         c7.metric("Trading Days", f"{len(df_sel):,}")
-        c8.metric("Min Price", f"${min_price:,.2f} ({min_date.strftime('%Y-%m-%d')})")
-        c9.metric("Max Price", f"${max_price:,.2f} ({max_date.strftime('%Y-%m-%d')})")
+        c8.metric("Min Price", f"${min_price:,.2f} ({min_date.strftime('%Y-%m-%d %A')})")
+        c9.metric("Max Price", f"${max_price:,.2f} ({max_date.strftime('%Y-%m-%d %A')})")
         
         # Price History Table
         st.markdown('<div class="section-header">Closing Price History</div>', unsafe_allow_html=True)
         df_display = df_sel[['Date', 'Close']].copy()
-        df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d')
+        df_display['Date'] = df_display['Date'].dt.strftime('%Y-%m-%d %A')
         df_display = df_display.sort_values('Date', ascending=False)
-        st.dataframe(df_display, use_container_width=True, height=300)
+        df_display = with_row_ref(df_display)
+        df_display = format_dataframe(df_display)
+        df_display = add_header_index(df_display)
+        df_styled = df_display.style.pipe(center_top_index)
+        st.dataframe(df_styled, use_container_width=True, height=300, hide_index=True)
         
         # Chart: Stock vs NASDAQ Composite
         st.markdown('<div class="section-header">Price Chart vs NASDAQ Composite</div>', unsafe_allow_html=True)
@@ -549,8 +736,8 @@ with tab2:
     
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Stocks", format_count(total_stocks))
-    m2.metric("Date Range Start", date_min.strftime('%Y-%m-%d'))
-    m3.metric("Date Range End", date_max.strftime('%Y-%m-%d'))
+    m2.metric("Date Range Start", date_min.strftime('%Y-%m-%d %A'))
+    m3.metric("Date Range End", date_max.strftime('%Y-%m-%d %A'))
     m4.metric("Total Trading Days", f"{df_stock['Date'].nunique():,}")
     
     pop_col1, pop_col2 = st.columns(2)
@@ -565,20 +752,28 @@ with tab2:
         df_mc_valid['MC Bucket'] = pd.cut(df_mc_valid['Market Cap $'], bins=bins, labels=labels, right=False)
         mc_dist = df_mc_valid['MC Bucket'].value_counts().sort_index().reset_index()
         mc_dist.columns = ['Market Cap Range', 'Count']
-        st.dataframe(mc_dist, use_container_width=True, hide_index=True)
+        mc_dist = with_row_ref(mc_dist)
+        mc_dist = format_dataframe(mc_dist)
+        mc_dist = add_header_index(mc_dist)
+        mc_dist_styled = mc_dist.style.pipe(center_top_index)
+        st.dataframe(mc_dist_styled, use_container_width=True, hide_index=True)
     
     with pop_col2:
         # Sector distribution
         st.markdown("**Sector Distribution**")
         sector_dist = df_mc['Sector'].value_counts().reset_index()
         sector_dist.columns = ['Sector', 'Count']
-        st.dataframe(sector_dist, use_container_width=True, hide_index=True)
+        sector_dist = with_row_ref(sector_dist)
+        sector_dist = format_dataframe(sector_dist)
+        sector_dist = add_header_index(sector_dist)
+        sector_dist_styled = sector_dist.style.pipe(center_top_index)
+        st.dataframe(sector_dist_styled, use_container_width=True, hide_index=True)
     
     # Industry distribution (collapsible)
     with st.expander("Industry Distribution", expanded=False):
         ind_dist = df_mc['Industry'].value_counts().reset_index()
         ind_dist.columns = ['Industry', 'Count']
-        st.dataframe(ind_dist, use_container_width=True, hide_index=True, height=400)
+        st.dataframe(with_row_ref(ind_dist), use_container_width=True, hide_index=True, height=400)
     
     st.divider()
     
@@ -617,11 +812,25 @@ with tab2:
     with fc5:
         event_type = st.selectbox(
             "E. Consecutive Day Event",
-            ['5 days', '7 days', '10 days'],
+            ['3 days', '5 days', '7 days', '10 days'],
             index=0, key='event_type'
         )
         streak_len = int(event_type.split()[0])
     with fc6:
+        event_direction = st.selectbox(
+            "Event Direction",
+            ['Both', 'Increase (UP)', 'Decrease (DOWN)'],
+            index=0, key='event_direction'
+        )
+        direction_map = {
+            'Both': 'both',
+            'Increase (UP)': 'up',
+            'Decrease (DOWN)': 'down',
+        }
+        selected_direction = direction_map[event_direction]
+
+    fc7, _, _ = st.columns(3)
+    with fc7:
         return_window = st.selectbox(
             "F. Return Comparison Window",
             ['30 days', '60 days', '90 days', '120 days'],
@@ -812,6 +1021,7 @@ with tab2:
                 df_filtered_mc[['Symbol', 'Company', 'Sector', 'Industry']],
                 on='Symbol', how='left'
             )
+            df_recent.dropna(subset=['Company'], inplace=True)
             
             # Add min/max/percentile from time-filtered data
             enriched = []
@@ -839,22 +1049,33 @@ with tab2:
                 })
             return pd.DataFrame(enriched)
         
+        show_up = selected_direction in ['both', 'up']
+        show_down = selected_direction in ['both', 'down']
         r_col1, r_col2 = st.columns(2)
         with r_col1:
-            st.markdown(f"**🟢 {streak_len}-Day UP Streaks (Last 14 Days)**")
-            df_recent_up = build_recent_table(recent_up, 'UP')
-            if len(df_recent_up) > 0:
-                st.dataframe(df_recent_up, use_container_width=True, hide_index=True)
-            else:
-                st.info("No UP streak events in the last 14 days.")
-        
+            if show_up:
+                st.markdown(f"**🟢 {streak_len}-Day UP Streaks (Last 14 Days)**")
+                df_recent_up = build_recent_table(recent_up, 'UP')
+                df_recent_up = with_row_ref(df_recent_up)
+                df_recent_up = format_dataframe(df_recent_up)
+                df_recent_up = add_header_index(df_recent_up)
+                df_recent_up_styled = df_recent_up.style.pipe(center_top_index)
+                if len(df_recent_up) > 0:
+                    st.dataframe(df_recent_up_styled, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No UP streak events in the last 14 days.")
         with r_col2:
-            st.markdown(f"**🔴 {streak_len}-Day DOWN Streaks (Last 14 Days)**")
-            df_recent_down = build_recent_table(recent_down, 'DOWN')
-            if len(df_recent_down) > 0:
-                st.dataframe(df_recent_down, use_container_width=True, hide_index=True)
-            else:
-                st.info("No DOWN streak events in the last 14 days.")
+            if show_down:
+                st.markdown(f"**🔴 {streak_len}-Day DOWN Streaks (Last 14 Days)**")
+                df_recent_down = build_recent_table(recent_down, 'DOWN')
+                df_recent_down = with_row_ref(df_recent_down)
+                df_recent_down = format_dataframe(df_recent_down)
+                df_recent_down = add_header_index(df_recent_down)
+                df_recent_down_styled = df_recent_down.style.pipe(center_top_index)
+                if len(df_recent_down) > 0:
+                    st.dataframe(df_recent_down_styled, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No DOWN streak events in the last 14 days.")
         
         st.divider()
         
@@ -886,8 +1107,8 @@ with tab2:
             
             # Format
             summary['Market Cap $'] = summary['Market Cap $'].apply(lambda x: format_number(x, 1))
-            summary['earliest'] = summary['earliest'].dt.strftime('%Y-%m-%d')
-            summary['latest'] = summary['latest'].dt.strftime('%Y-%m-%d')
+            summary['earliest'] = summary['earliest'].dt.strftime('%Y-%m-%d %A')
+            summary['latest'] = summary['latest'].dt.strftime('%Y-%m-%d %A')
             
             for col in ['avg_stock_return', 'max_stock_return', 'min_stock_return',
                         'avg_nasdaq_return', 'max_nasdaq_return', 'min_nasdaq_return']:
@@ -912,22 +1133,32 @@ with tab2:
             return summary[[c for c in cols_order if c in summary.columns]].sort_values('# Events', ascending=False)
         
         # UP streaks summary
-        st.markdown(f"**🟢 {streak_len}-Day Consecutive UP Streaks → {return_days}-Day Forward Returns**")
-        df_summary_up = build_summary(all_events_up, 'UP')
-        if len(df_summary_up) > 0:
-            st.metric("Total UP Events", f"{len(all_events_up):,} across {df_summary_up['Symbol'].nunique()} stocks")
-            st.dataframe(df_summary_up, use_container_width=True, hide_index=True, height=400)
-        else:
-            st.info("No UP streak events found with current filters.")
+        if show_up:
+            st.markdown(f"**🟢 {streak_len}-Day Consecutive UP Streaks → {return_days}-Day Forward Returns**")
+            df_summary_up = build_summary(all_events_up, 'UP')
+            df_summary_up_display = with_row_ref(df_summary_up)
+            df_summary_up_display = format_dataframe(df_summary_up_display)
+            df_summary_up_display = add_header_index(df_summary_up_display)
+            df_summary_up_styled = df_summary_up_display.style.pipe(center_top_index)
+            if len(df_summary_up) > 0:
+                st.metric("Total UP Events", f"{len(all_events_up):,} across {df_summary_up['Symbol'].nunique()} stocks")
+                st.dataframe(df_summary_up_styled, use_container_width=True, hide_index=True, height=400)
+            else:
+                st.info("No UP streak events found with current filters.")
         
         # DOWN streaks summary
-        st.markdown(f"**🔴 {streak_len}-Day Consecutive DOWN Streaks → {return_days}-Day Forward Returns**")
-        df_summary_down = build_summary(all_events_down, 'DOWN')
-        if len(df_summary_down) > 0:
-            st.metric("Total DOWN Events", f"{len(all_events_down):,} across {df_summary_down['Symbol'].nunique()} stocks")
-            st.dataframe(df_summary_down, use_container_width=True, hide_index=True, height=400)
-        else:
-            st.info("No DOWN streak events found with current filters.")
+        if show_down:
+            st.markdown(f"**🔴 {streak_len}-Day Consecutive DOWN Streaks → {return_days}-Day Forward Returns**")
+            df_summary_down = build_summary(all_events_down, 'DOWN')
+            df_summary_down_display = with_row_ref(df_summary_down)
+            df_summary_down_display = format_dataframe(df_summary_down_display)
+            df_summary_down_display = add_header_index(df_summary_down_display)
+            df_summary_down_styled = df_summary_down_display.style.pipe(center_top_index)
+            if len(df_summary_down) > 0:
+                st.metric("Total DOWN Events", f"{len(all_events_down):,} across {df_summary_down['Symbol'].nunique()} stocks")
+                st.dataframe(df_summary_down_styled, use_container_width=True, hide_index=True, height=400)
+            else:
+                st.info("No DOWN streak events found with current filters.")
     
     else:
         st.warning("No stocks remain after applying filters. Please adjust your exclusion criteria.")
@@ -951,7 +1182,6 @@ with tab3:
     
     if len(in_scope_symbols) == 0:
         st.warning("No stocks in scope. Please adjust filters in Tab 2.")
-        st.stop()
     
     # ── Compute probability tables & return matrices ─────────────────────────
     @st.cache_data(ttl=600)
@@ -1018,208 +1248,229 @@ with tab3:
         
         return all_streak_data, all_return_data
     
-    with st.spinner("Computing macro statistics..."):
-        time_start_str2 = str(time_start) if time_start else None
-        stock_hash2 = f"{len(df_stock)}_{df_stock['Date'].max()}"
-        all_streak_data, all_return_data = compute_macro_stats(
-            tuple(in_scope_symbols), time_start_str2, stock_hash2
-        )
-    
+    all_streak_data, all_return_data = [], []
+    if len(in_scope_symbols) > 0:
+        with st.spinner("Computing macro statistics..."):
+            time_start_str2 = str(time_start) if time_start else None
+            stock_hash2 = f"{len(df_stock)}_{df_stock['Date'].max()}"
+            all_streak_data, all_return_data = compute_macro_stats(
+                tuple(in_scope_symbols), time_start_str2, stock_hash2
+            )
+
     if not all_streak_data:
-        st.warning("Insufficient data for macro analysis.")
-        st.stop()
-    
-    df_streaks_all = pd.DataFrame(all_streak_data)
-    df_returns_all = pd.DataFrame(all_return_data) if all_return_data else pd.DataFrame()
-    
-    def render_macro_section(df_streaks, df_returns, section_label):
-        """Render probability tables, return tables, and charts for a subset."""
-        
-        st.markdown(f"#### {section_label}")
-        
-        # 1. Probability Tables
-        st.markdown("**Probability of Consecutive Price Movement (0-10 Days)**")
-        
-        # Aggregate by streak_days
+        st.info("Insufficient data for macro analysis with current filters.")
+    else:
+        df_streaks_all = pd.DataFrame(all_streak_data)
+        df_returns_all = pd.DataFrame(all_return_data) if all_return_data else pd.DataFrame()
+
+        df_streaks = df_streaks_all if agg_level == 'All Stocks (Aggregate)' else df_streaks_all[df_streaks_all['Sector'] == agg_level]
+        df_returns = df_returns_all if agg_level == 'All Stocks (Aggregate)' else df_returns_all[df_returns_all['Sector'] == agg_level]
+        st.markdown(f"#### {'All Stocks in Scope' if agg_level == 'All Stocks (Aggregate)' else f'Sector: {agg_level}'}")
+
         prob_data = df_streaks.groupby('streak_days').agg(
             total_up=('up_count', 'sum'),
             total_down=('down_count', 'sum'),
             total_days=('total_days', 'sum'),
         ).reset_index()
-        
-        # Probability = events / (total trading days across all stocks)
-        total_stock_days = df_streaks.groupby('Symbol')['total_days'].first().sum()
+        total_stock_days = max(df_streaks.groupby('Symbol')['total_days'].first().sum(), 1)
         prob_data['P(UP streak)'] = (prob_data['total_up'] / total_stock_days * 100).round(2)
         prob_data['P(DOWN streak)'] = (prob_data['total_down'] / total_stock_days * 100).round(2)
-        prob_data['UP Events'] = prob_data['total_up']
-        prob_data['DOWN Events'] = prob_data['total_down']
-        
-        prob_display = prob_data[['streak_days', 'UP Events', 'P(UP streak)', 'DOWN Events', 'P(DOWN streak)']].copy()
+        prob_display = prob_data[['streak_days', 'total_up', 'P(UP streak)', 'total_down', 'P(DOWN streak)']].copy()
         prob_display.columns = ['Consecutive Days', 'UP Events', 'P(UP) %', 'DOWN Events', 'P(DOWN) %']
-        
+        prob_display_up = prob_display[['Consecutive Days', 'UP Events', 'P(UP) %']]
+        prob_display_down = prob_display[['Consecutive Days', 'DOWN Events', 'P(DOWN) %']]
+        prob_display_up, prob_display_down = with_row_ref(prob_display_up), with_row_ref(prob_display_down)
+        prob_display_up, prob_display_down = format_dataframe(prob_display_up), format_dataframe(prob_display_down)
+        prob_display_up, prob_display_down = add_header_index(prob_display_up), add_header_index(prob_display_down)
+        # prob_display_styled = prob_display.style.pipe(center_top_index)
+
         pc1, pc2 = st.columns(2)
         with pc1:
             st.markdown("🟢 **UP Streak Probabilities**")
-            st.dataframe(prob_display[['Consecutive Days', 'UP Events', 'P(UP) %']], 
-                        use_container_width=True, hide_index=True)
+            st.dataframe(prob_display_up, use_container_width=True, hide_index=True)
         with pc2:
             st.markdown("🔴 **DOWN Streak Probabilities**")
-            st.dataframe(prob_display[['Consecutive Days', 'DOWN Events', 'P(DOWN) %']], 
-                        use_container_width=True, hide_index=True)
-        
-        # Probability chart
-        fig_prob = go.Figure()
-        fig_prob.add_trace(go.Bar(
-            x=prob_display['Consecutive Days'], y=prob_display['P(UP) %'],
-            name='UP Streak', marker_color='#00c853'
-        ))
-        fig_prob.add_trace(go.Bar(
-            x=prob_display['Consecutive Days'], y=prob_display['P(DOWN) %'],
-            name='DOWN Streak', marker_color='#ff1744'
-        ))
-        fig_prob.update_layout(
-            template='plotly_dark', height=350, barmode='group',
-            title="Streak Probability by Consecutive Days",
-            xaxis_title="Consecutive Days", yaxis_title="Probability (%)",
-            margin=dict(l=60, r=40, t=60, b=40),
-        )
-        st.plotly_chart(fig_prob, use_container_width=True)
-        
-        # 2. Return Comparison Table
+            st.dataframe(prob_display_down, use_container_width=True, hide_index=True)
+
         if len(df_returns) > 0:
-            st.markdown("**Average Returns: Stock vs NASDAQ Composite**")
-            
             ret_summary = df_returns.groupby(['streak_days', 'direction', 'return_window']).agg(
                 avg_stock=('stock_return', 'mean'),
                 avg_nasdaq=('nasdaq_return', 'mean'),
                 count=('stock_return', 'count'),
             ).reset_index()
-            
+            ret_summary['excess'] = (ret_summary['avg_stock'] - ret_summary['avg_nasdaq']).round(1).astype(str) 
             ret_summary['avg_stock'] = ret_summary['avg_stock'].round(1)
             ret_summary['avg_nasdaq'] = ret_summary['avg_nasdaq'].round(1)
-            ret_summary['excess'] = (ret_summary['avg_stock'] - ret_summary['avg_nasdaq']).round(1)
-            
-            ret_pivot = ret_summary.copy()
-            ret_pivot['Label'] = ret_pivot.apply(
+            ret_summary['Label'] = ret_summary.apply(
                 lambda r: f"{'↑' if r['direction']=='up' else '↓'} {r['streak_days']}d → {r['return_window']}d", axis=1
             )
-            
-            ret_display = ret_pivot[['Label', 'count', 'avg_stock', 'avg_nasdaq', 'excess']].copy()
+            ret_display = ret_summary[['Label', 'count', 'avg_stock', 'avg_nasdaq', 'excess']].copy()
             ret_display.columns = ['Event → Window', '# Events', 'Avg Stock Return %', 'Avg NASDAQ Return %', 'Excess Return %']
-            st.dataframe(ret_display, use_container_width=True, hide_index=True, height=400)
-            
-            # 3. Visualisations
-            st.markdown("**Visualisations**")
-            
-            # Heatmap: Average excess return by streak length and return window
-            for direction in ['up', 'down']:
-                dir_label = "UP" if direction == 'up' else "DOWN"
-                dir_data = ret_summary[ret_summary['direction'] == direction]
-                if len(dir_data) == 0:
-                    continue
-                
-                heatmap_data = dir_data.pivot_table(
-                    index='streak_days', columns='return_window', values='excess', aggfunc='mean'
-                )
-                
-                if len(heatmap_data) > 0:
-                    fig_heat = px.imshow(
-                        heatmap_data.values,
-                        x=[f"{c}d" for c in heatmap_data.columns],
-                        y=[f"{r}d streak" for r in heatmap_data.index],
-                        color_continuous_scale='RdYlGn',
-                        labels=dict(x="Return Window", y="Streak Length", color="Excess Return %"),
-                        title=f"{'🟢' if direction == 'up' else '🔴'} {dir_label} Streaks — Excess Return vs NASDAQ (%)",
-                        text_auto='.1f',
-                    )
-                    fig_heat.update_layout(
-                        template='plotly_dark', height=400,
-                        margin=dict(l=80, r=40, t=60, b=40),
-                    )
-                    st.plotly_chart(fig_heat, use_container_width=True)
-            
-            # Bar chart: Stock vs NASDAQ returns for selected streak
-            for direction in ['up', 'down']:
-                dir_label = "UP" if direction == 'up' else "DOWN"
-                dir_data = ret_summary[(ret_summary['direction'] == direction) & (ret_summary['streak_days'] == streak_len)]
-                if len(dir_data) == 0:
-                    continue
-                
-                fig_bar = go.Figure()
-                fig_bar.add_trace(go.Bar(
-                    x=[f"{r}d" for r in dir_data['return_window']],
-                    y=dir_data['avg_stock'],
-                    name='Avg Stock Return', marker_color='#00d4ff',
-                ))
-                fig_bar.add_trace(go.Bar(
-                    x=[f"{r}d" for r in dir_data['return_window']],
-                    y=dir_data['avg_nasdaq'],
-                    name='Avg NASDAQ Return', marker_color='#ff6b6b',
-                ))
-                fig_bar.update_layout(
-                    template='plotly_dark', height=350, barmode='group',
-                    title=f"{'🟢' if direction == 'up' else '🔴'} After {streak_len}-Day {dir_label} Streak: Avg Returns",
-                    xaxis_title="Return Window", yaxis_title="Avg Return (%)",
-                    margin=dict(l=60, r=40, t=60, b=40),
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-            
-            # Distribution plot: stock returns after streak events
-            for direction in ['up', 'down']:
-                dir_label = "UP" if direction == 'up' else "DOWN"
-                dir_returns = df_returns[
-                    (df_returns['direction'] == direction) &
-                    (df_returns['streak_days'] == streak_len) &
-                    (df_returns['return_window'] == return_days)
-                ]
-                if len(dir_returns) > 5:
-                    fig_dist = go.Figure()
-                    fig_dist.add_trace(go.Histogram(
-                        x=dir_returns['stock_return'], name='Stock Return',
-                        marker_color='#00d4ff', opacity=0.7, nbinsx=40,
-                    ))
-                    fig_dist.add_trace(go.Histogram(
-                        x=dir_returns['nasdaq_return'], name='NASDAQ Return',
-                        marker_color='#ff6b6b', opacity=0.7, nbinsx=40,
-                    ))
-                    fig_dist.update_layout(
-                        template='plotly_dark', height=350, barmode='overlay',
-                        title=f"Return Distribution: {streak_len}d {dir_label} Streak → {return_days}d Returns",
-                        xaxis_title="Return (%)", yaxis_title="Frequency",
-                        margin=dict(l=60, r=40, t=60, b=40),
-                    )
-                    st.plotly_chart(fig_dist, use_container_width=True)
-            
-            # Scatter: Stock return vs NASDAQ return
-            scatter_data = df_returns[
-                (df_returns['streak_days'] == streak_len) &
-                (df_returns['return_window'] == return_days)
-            ]
-            if len(scatter_data) > 5:
-                fig_scatter = px.scatter(
-                    scatter_data, x='nasdaq_return', y='stock_return',
-                    color='direction',
-                    color_discrete_map={'up': '#00c853', 'down': '#ff1744'},
-                    title=f"Stock vs NASDAQ {return_days}d Return (After {streak_len}d Streak)",
-                    labels={'nasdaq_return': 'NASDAQ Return (%)', 'stock_return': 'Stock Return (%)'},
-                    opacity=0.5,
-                )
-                fig_scatter.add_shape(type='line', x0=-50, y0=-50, x1=100, y1=100,
-                                     line=dict(color='gray', dash='dash'))
-                fig_scatter.update_layout(
-                    template='plotly_dark', height=450,
-                    margin=dict(l=60, r=40, t=60, b=40),
-                )
-                st.plotly_chart(fig_scatter, use_container_width=True)
-    
-    # Render based on aggregation level
-    if agg_level == 'All Stocks (Aggregate)':
-        render_macro_section(df_streaks_all, df_returns_all, "All Stocks in Scope")
-    else:
-        # Filter to selected sector
-        df_s_sec = df_streaks_all[df_streaks_all['Sector'] == agg_level]
-        df_r_sec = df_returns_all[df_returns_all['Sector'] == agg_level] if len(df_returns_all) > 0 else pd.DataFrame()
-        render_macro_section(df_s_sec, df_r_sec, f"Sector: {agg_level}")
+            st.dataframe(with_row_ref(ret_display), use_container_width=True, hide_index=True, height=360)
+
+            st.markdown("**Component 3: Candlestick (Aggregate Average Returns)**")
+            cand_src = df_returns[(df_returns['streak_days'] == streak_len) & (df_returns['return_window'] == return_days)].copy()
+            if selected_direction in ['up', 'down']:
+                cand_src = cand_src[cand_src['direction'] == selected_direction]
+            if len(cand_src) > 0:
+                stock_vals = cand_src['stock_return'].dropna()
+                idx_vals = cand_src['nasdaq_return'].dropna()
+                if len(stock_vals) > 0 and len(idx_vals) > 0:
+                    fig_candle = go.Figure()
+                    fig_candle.add_trace(go.Candlestick(x=['Aggregate Stock Return'], open=[0.0], high=[float(stock_vals.max())], low=[float(stock_vals.min())], close=[float(stock_vals.mean())], name='Stock'))
+                    fig_candle.add_trace(go.Candlestick(x=['Aggregate NASDAQ Return'], open=[0.0], high=[float(idx_vals.max())], low=[float(idx_vals.min())], close=[float(idx_vals.mean())], name='NASDAQ'))
+                    fig_candle.update_layout(template='plotly_dark', height=420, yaxis_title="Return (%)", margin=dict(l=60, r=40, t=60, b=40))
+                    st.plotly_chart(fig_candle, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4: Annual Returns Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown('<div class="section-header">Annual Return Pattern Analysis</div>', unsafe_allow_html=True)
+    st.caption("Stocks hitting +/-50% annual return thresholds over one-year or two-year windows.")
+
+    df_yearly = compute_year_bound_prices(df_stock)
+    df_idx_year = compute_index_year_returns(df_idx)
+
+    # Base metadata (drop missing Company as required)
+    df_meta = df_mc[['Symbol', 'Company', 'Market Cap $', 'Sector', 'Industry']].copy()
+    df_meta = df_meta.dropna(subset=['Company'])
+    df_meta = df_meta[df_meta['Company'].astype(str).str.strip() != ""]
+
+    # Current and 52-week percentile
+    latest_px = df_stock.sort_values('Date').groupby('Symbol').tail(1)[['Symbol', 'Close']].rename(
+        columns={'Close': 'Current Price'}
+    )
+    p52_rows = []
+    for sym, grp in df_stock.groupby('Symbol'):
+        p52_rows.append({'Symbol': sym, '52 Week Percentile': percentile_52w(grp)})
+    df_p52 = pd.DataFrame(p52_rows)
+    stats_tail = latest_px.merge(df_p52, on='Symbol', how='left')
+
+    # Build 1Y event tables (Table 1A / 1B)
+    one_y = df_yearly.rename(columns={
+        'Year': 'Year [1]',
+        'Stock Return': 'Stock Return [Year 1]',
+        'Start Price': 'Start Price',
+        'End Price': 'End Price',
+    }).copy()
+    y2 = df_yearly[['Symbol', 'Year', 'Stock Return']].copy()
+    y2['Year [1]'] = y2['Year'] - 1
+    y2.rename(columns={'Stock Return': 'Stock Return [Year 2]'}, inplace=True)
+    one_y = one_y.merge(y2[['Symbol', 'Year [1]', 'Stock Return [Year 2]']], on=['Symbol', 'Year [1]'], how='left')
+
+    idx_y1 = df_idx_year.rename(columns={'Year': 'Year [1]', 'Nasdaq Return': 'Nasdaq Return [Year 1]'})
+    idx_y2 = df_idx_year.copy()
+    idx_y2['Year [1]'] = idx_y2['Year'] - 1
+    idx_y2.rename(columns={'Nasdaq Return': 'Nasdaq Return [Year 2]'}, inplace=True)
+    one_y = one_y.merge(idx_y1[['Year [1]', 'Nasdaq Return [Year 1]']], on='Year [1]', how='left')
+    one_y = one_y.merge(idx_y2[['Year [1]', 'Nasdaq Return [Year 2]']], on='Year [1]', how='left')
+    one_y = one_y.merge(df_meta, on='Symbol', how='inner').merge(stats_tail, on='Symbol', how='left')
+
+    one_y_cols = [
+        'Company', 'Symbol', 'Market Cap $', 'Sector', 'Industry', 'Year [1]',
+        'Start Price', 'End Price', 'Stock Return [Year 1]', 'Nasdaq Return [Year 1]',
+        'Stock Return [Year 2]', 'Nasdaq Return [Year 2]', 'Current Price', '52 Week Percentile'
+    ]
+    one_y = one_y[one_y_cols]
+
+    t1a = one_y[one_y['Stock Return [Year 1]'] >= 50].sort_values(['Year [1]', 'Stock Return [Year 1]'], ascending=[False, False])
+    t1b = one_y[one_y['Stock Return [Year 1]'] <= -50].sort_values(['Year [1]', 'Stock Return [Year 1]'], ascending=[False, True])
+
+    # Build 2Y consecutive event tables (Table 2A / 2B)
+    y1 = df_yearly[['Symbol', 'Year', 'Start Price', 'End Price', 'Stock Return']].copy()
+    y2b = df_yearly[['Symbol', 'Year', 'Start Price', 'End Price', 'Stock Return']].copy()
+    y2b['Year [1]'] = y2b['Year'] - 1
+    y2b.rename(columns={
+        'Year': 'Year [2]',
+        'End Price': 'End Price [Year 2]',
+        'Stock Return': 'Stock Return [Year 2]'
+    }, inplace=True)
+    two_y = y1.rename(columns={
+        'Year': 'Year [1]',
+        'Stock Return': 'Stock Return [Year 1]'
+    }).merge(
+        y2b[['Symbol', 'Year [1]', 'Year [2]', 'End Price [Year 2]', 'Stock Return [Year 2]']],
+        on=['Symbol', 'Year [1]'],
+        how='inner'
+    )
+    two_y['End Price'] = two_y['End Price [Year 2]']
+    two_y['Combined Return [Year1+Year2]'] = ((1 + two_y['Stock Return [Year 1]'] / 100.0) * (1 + two_y['Stock Return [Year 2]'] / 100.0) - 1) * 100
+
+    idx1 = df_idx_year.rename(columns={'Year': 'Year [1]', 'Nasdaq Return': 'Nasdaq Return [Year 1]'})
+    idx2 = df_idx_year.copy()
+    idx2['Year [1]'] = idx2['Year'] - 1
+    idx2.rename(columns={'Nasdaq Return': 'Nasdaq Return [Year 2]'}, inplace=True)
+    idx3 = df_idx_year.copy()
+    idx3['Year [1]'] = idx3['Year'] - 2
+    idx3.rename(columns={'Nasdaq Return': 'Nasdaq Return [Year 3]'}, inplace=True)
+
+    y3_stock = df_yearly[['Symbol', 'Year', 'Stock Return']].copy()
+    y3_stock['Year [1]'] = y3_stock['Year'] - 2
+    y3_stock.rename(columns={'Stock Return': 'Stock Return [Year 3]'}, inplace=True)
+
+    two_y = two_y.merge(idx1[['Year [1]', 'Nasdaq Return [Year 1]']], on='Year [1]', how='left')
+    two_y = two_y.merge(idx2[['Year [1]', 'Nasdaq Return [Year 2]']], on='Year [1]', how='left')
+    two_y = two_y.merge(idx3[['Year [1]', 'Nasdaq Return [Year 3]']], on='Year [1]', how='left')
+    two_y = two_y.merge(y3_stock[['Symbol', 'Year [1]', 'Stock Return [Year 3]']], on=['Symbol', 'Year [1]'], how='left')
+    two_y = two_y.merge(df_meta, on='Symbol', how='inner').merge(stats_tail, on='Symbol', how='left')
+
+    two_y_cols = [
+        'Company', 'Symbol', 'Market Cap $', 'Sector', 'Industry', 'Year [1]',
+        'Start Price', 'End Price', 'Stock Return [Year 1]', 'Stock Return [Year 2]',
+        'Nasdaq Return [Year 1]', 'Nasdaq Return [Year 2]', 'Stock Return [Year 3]',
+        'Nasdaq Return [Year 3]', 'Current Price', '52 Week Percentile', 'Combined Return [Year1+Year2]'
+    ]
+    two_y = two_y[two_y_cols]
+    t2a = two_y[two_y['Combined Return [Year1+Year2]'] >= 50].sort_values(['Year [1]', 'Combined Return [Year1+Year2]'], ascending=[False, False])
+    t2b = two_y[two_y['Combined Return [Year1+Year2]'] <= -50].sort_values(['Year [1]', 'Combined Return [Year1+Year2]'], ascending=[False, True])
+    t2a = t2a.drop(columns=['Combined Return [Year1+Year2]'])
+    t2b = t2b.drop(columns=['Combined Return [Year1+Year2]'])
+
+    # Formatting
+    def _fmt_annual(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_out = df_in.copy()
+        if 'Market Cap $' in df_out.columns:
+            df_out['Market Cap $'] = df_out['Market Cap $'].apply(lambda x: format_number(x, 1))
+        if 'Current Price' in df_out.columns:
+            df_out['Current Price'] = df_out['Current Price'].apply(lambda x: f"${x:,.2f}" if not pd.isna(x) else "N/A")
+        for c in [col for col in df_out.columns if 'Return' in col or 'Percentile' in col]:
+            if c == 'Current Price':
+                continue
+            df_out[c] = df_out[c].apply(lambda x: f"{x:.1f}%" if not pd.isna(x) else "N/A")
+        for c in [col for col in df_out.columns if 'Price' in col and c != 'Current Price']:
+            df_out[c] = df_out[c].apply(lambda x: f"${x:,.2f}" if not pd.isna(x) else "N/A")
+        return df_out
+
+    # t1a, t1b, t2a, t2b = map(_fmt_annual, [t1a, t1b, t2a, t2b])
+    t1a, t1b, t2a, t2b = map(with_row_ref, [t1a, t1b, t2a, t2b])
+    t1a['Year [1]'] = t1a['Year [1]'].astype(str)
+    t1b['Year [1]'] = t1b['Year [1]'].astype(str)
+    t2a['Year [1]'] = t2a['Year [1]'].astype(str)
+    t2b['Year [1]'] = t2b['Year [1]'].astype(str)
+    t1a, t1b, t2a, t2b = map(format_dataframe, [t1a, t1b, t2a, t2b])
+    t1a, t1b, t2a, t2b = map(add_header_index, [t1a, t1b, t2a, t2b])
+    t1a_styled = t1a.style.pipe(center_top_index)
+    t1b_styled = t1b.style.pipe(center_top_index)
+    t2a_styled = t2a.style.pipe(center_top_index)
+    t2b_styled = t2b.style.pipe(center_top_index)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Table 1.A — +50% or More in Year [1]**")
+        st.dataframe(t1a_styled, use_container_width=True, hide_index=True, height=360)
+    with c2:
+        st.markdown("**Table 1.B — -50% or Less in Year [1]**")
+        st.dataframe(t1b_styled, use_container_width=True, hide_index=True, height=360)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        st.markdown("**Table 2.A — +50% or More Over Year [1]+[2]**")
+        st.dataframe(t2a_styled, use_container_width=True, hide_index=True, height=360)
+    with c4:
+        st.markdown("**Table 2.B — -50% or Less Over Year [1]+[2]**")
+        st.dataframe(t2b_styled, use_container_width=True, hide_index=True, height=360)
 
 
 # ─── Footer ──────────────────────────────────────────────────────────────────
