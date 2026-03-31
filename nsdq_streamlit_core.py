@@ -161,7 +161,7 @@ def clean_company_name(name: str, word_list: list) -> str:
 def load_data():
     """Load and prepare all data files."""
     # 1. Market cap data
-    mc_path = DATA_DIR / "NK_market_cap_large.xlsx"
+    mc_path = DATA_DIR / "NK_market_cap.xlsx"
     df_mc = pd.read_excel(mc_path, sheet_name=0)
     df_mc.columns = df_mc.columns.str.strip()
     
@@ -206,14 +206,14 @@ def load_data():
             df_mc['Market Cap $'] = df_mc[mc_cols[0]].apply(parse_market_cap)
     
     # 2. Stock price data
-    stock_path = DATA_DIR / "NK_stock_data_large.csv"
+    stock_path = DATA_DIR / "NK_stock_data.csv"
     df_stock = pd.read_csv(stock_path, parse_dates=['Date'])
     df_stock.columns = df_stock.columns.str.strip()
     df_stock = df_stock.sort_values(['Symbol', 'Date']).reset_index(drop=True)
     
     # 3. NASDAQ Index data
     # Try multiple extensions
-    idx_base = "NK_nsdq_index_large"
+    idx_base = "NK_nsdq_index"
     idx_path = None
     for ext in ['.csv', '.xlsx', '']:
         p = DATA_DIR / (idx_base + ext)
